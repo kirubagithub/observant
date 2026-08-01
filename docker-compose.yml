@@ -1,0 +1,16 @@
+services:
+  anomaly-app:
+    build: .
+    image: inmobi-anomaly-scanner:latest
+    ports:
+      - "8501:8501"
+    env_file:
+      - .env
+    restart: unless-stopped
+    volumes:
+      # Incident annotations (SQLite) live here. Without this volume, every
+      # `docker compose down` / rebuild silently wipes acknowledged incidents.
+      - anomaly-annotations:/app/data
+ 
+volumes:
+  anomaly-annotations:

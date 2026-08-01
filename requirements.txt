@@ -1,0 +1,15 @@
+# width="stretch" replaced use_container_width; 1.49 is an approximate floor,
+# verified working on 1.60. Bump if you see the deprecation warning.
+streamlit>=1.49,<2.0
+clickhouse-connect>=0.7,<0.8
+pandas>=2.1,<3.0
+numpy>=1.26,<3.0
+plotly>=5.20,<6.0
+python-dotenv>=1.0,<2.0
+
+# LLM report generation (Groq via the OpenAI-compatible endpoint) + tracing.
+# Versions verified against a live install: langfuse 4.14.2, openai 2.52.0.
+# Langfuse v4 renamed the host variable to LANGFUSE_BASE_URL; if you pin v3 or
+# older, use LANGFUSE_HOST instead.
+openai>=2.0,<3.0
+langfuse>=4.0,<5.0
