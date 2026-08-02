@@ -38,6 +38,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 import clickhouse_queries as chq
+import geo
 import langfuse_tracing as lft
 
 CACHE_TTL = 600  # seconds; drill-downs re-query often, the agg table moves
@@ -332,9 +333,13 @@ def render_dimension_panel(client, verdict: dict, dimension_name: str, grain, ke
         st.info("No values returned for this dimension.")
         return
 
-    tab_table, tab_waterfall, tab_heatmap = st.tabs(
-        ["📋 All values", "💧 Contribution waterfall", "🔥 Onset heatmap"]
-    )
+    is_country = dimension_name.strip().lower() == "country"
+    tab_labels = ["📋 All values", "💧 Contribution waterfall", "🔥 Onset heatmap"]
+    if is_country:
+        tab_labels.append("🗺️ Map")
+    tabs = st.tabs(tab_labels)
+    tab_table, tab_waterfall, tab_heatmap = tabs[0], tabs[1], tabs[2]
+    tab_map = tabs[3] if is_country else None
 
     # --- every value in the dimension -------------------------------------
     with tab_table:
@@ -450,6 +455,44 @@ def render_dimension_panel(client, verdict: dict, dimension_name: str, grain, ke
             + (f"{window_values[0]} → {window_values[-1]}" if len(window_values) > 1 else str(window_values[0]))
             + ". Red = below that value's own baseline, green = above."
         )
+
+    # --- geo map (country dimension only) ---------------------------------
+    if tab_map is not None:
+        with tab_map:
+            st.caption(
+                "Colour = ratio vs baseline for that country during the incident window. "
+                "Country codes are ISO-3166 alpha-2 per the dataset glossary; `UK` is aliased "
+                "to `GB` (the actual ISO code) before mapping."
+            )
+            mapped, unmapped = geo.map_dataframe(values, code_col="dimension_value")
+
+            if mapped.empty:
+                st.info("No country codes in this data could be mapped.")
+            else:
+                map_fig = px.choropleth(
+                    mapped,
+                    locations="alpha3",
+                    color="ratio",
+                    hover_name="country_name",
+                    hover_data={"alpha3": False, "window_value": ":.4f",
+                               "baseline_value": ":.4f", "contribution_share": ":.1%"},
+                    color_continuous_scale=["#e63946", "#f8f9fa", "#2a9d8f"],
+                    color_continuous_midpoint=1.0,
+                    projection="natural earth",
+                )
+                map_fig.update_layout(
+                    height=440, margin=dict(l=0, r=0, t=10, b=0),
+                    coloraxis_colorbar=dict(title="Ratio"),
+                )
+                map_fig.update_geos(showframe=False, showcoastlines=False,
+                                    bgcolor="rgba(0,0,0,0)")
+                st.plotly_chart(map_fig, width="stretch", key=f"{key_prefix}_geomap")
+
+            if unmapped:
+                st.caption(
+                    f"⚠️ {len(unmapped)} code(s) not recognised as ISO-3166 and excluded from "
+                    f"the map (still shown in the table tab): {', '.join(unmapped)}"
+                )
 
 
 # ---------------------------------------------------------------------------

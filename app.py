@@ -1,11 +1,20 @@
 import os
 
+import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+import plotly.io as pio
 from plotly.subplots import make_subplots
 import streamlit as st
 from dotenv import load_dotenv
+
+# Every chart in the app (here and in drilldowns.py, imported below and run
+# in this same process) inherits this — one line instead of restyling each
+# figure individually. The one existing explicit background override (the
+# geo map's transparent geos) is compatible with a dark template, not
+# fighting it.
+pio.templates.default = "plotly_dark"
 
 import annotations as ann
 import drilldowns as dd
@@ -24,6 +33,36 @@ load_dotenv()
 sanitize_env()   # strip stray quotes from .env values before any SDK reads them
 
 st.set_page_config(page_title="Heimdall for InMobi", layout="wide", page_icon="👁️")
+
+# ---------------------------------------------------------------------------
+# Button text-contrast fix — the one real gap left after moving to
+# config.toml's native theming (see .streamlit/config.toml for the full
+# rationale). There is no config.toml key for "primary button text color"
+# independent of its background, so a bright yellow primary button gets
+# whatever text color Streamlit's component library defaults to — which
+# was unreadable white-on-yellow.
+#
+# Targeted via Streamlit's documented `.st-key-<name>` classes (generated
+# automatically from each widget's `key=`) rather than generic selectors
+# like `.stButton > button` — Streamlit has a confirmed, open bug (GitHub
+# issue #10384) where broadly-targeted injected <style> can be present in
+# the DOM but silently fail to apply; the key-based classes are the
+# pattern Streamlit's own current guidance recommends specifically because
+# it's more reliable in practice.
+st.markdown(
+    """
+    <style>
+    .st-key-scan_button button {
+        color: #000000 !important;
+    }
+    .st-key-scan_button button p {
+        color: inherit !important;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 
 # ---------------------------------------------------------------------------
 # Session lifecycle — explicit, not incidental.
@@ -86,24 +125,37 @@ z_threshold = st.sidebar.slider(
     help="How many standard deviations from the period average a point must be to flag. "
          "Lower = more sensitive, more false positives. Higher = fewer, larger-only incidents.",
 )
-dispersion_ratio_threshold = st.sidebar.slider(
-    "Culprit dominance ratio (vs 2nd place dimension)", 1.5, 5.0, 3.0, 0.1,
-    help="The top dimension's dispersion must be at least this many times the runner-up's "
-         "to be called a culprit. Below this, the move is treated as platform-wide instead — "
-         "everything moved together, so no single segment is to blame.",
+min_contribution_share = st.sidebar.slider(
+    "Minimum contribution share to call a culprit", 0.1, 0.9, 0.5, 0.05,
+    help="A culprit is named when one (dimension, value) pair explains at least this share "
+         "of the total observed change — e.g. 0.5 means 'this one segment accounts for at "
+         "least half the move.' Below this, the incident is treated as platform-wide. "
+         "Replaces the old dispersion-ratio threshold, which could rank a mild 3-way mix "
+         "shift above a genuinely broken single value in a larger dimension.",
 )
-min_dispersion = st.sidebar.slider(
-    "Minimum dispersion to call a culprit", 0.0, 0.1, 0.02, 0.005,
-    help="A floor below which even the top dimension is considered noise, not a real culprit — "
-         "guards against calling a culprit when nothing actually moved much.",
+min_volume_share = st.sidebar.slider(
+    "Minimum segment volume share", 0.0, 0.10, 0.01, 0.005,
+    help="A segment must carry at least this fraction of its dimension's baseline volume "
+         "to be considered — guards against a near-empty segment producing a wild ratio "
+         "and a misleadingly large contribution purely from noise.",
 )
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("📊 Chart options")
 show_band = st.sidebar.checkbox(
     "Show detection band on trend", value=True,
-    help="Shades the ±z·σ corridor the scan uses — anything outside it is what triggers a flag.",
+    help="Shades the normal range the scan uses — anything outside it is what triggers a flag. "
+         "Now computed per seasonal bucket (same weekday for Daily, same weekday+hour for "
+         "Hourly), not a single flat range for the whole period.",
 )
+band_style = "Percentile (P10–P90)"
+if show_band:
+    band_style = st.sidebar.radio(
+        "Band style", ["Percentile (P10–P90)", "Parametric (mean ± z·σ)"],
+        help="Percentile bands make no assumption about the shape of the distribution — "
+             "recommended when a metric doesn't look bell-curve-shaped. Parametric is the "
+             "classic mean ± z·σ corridor, now also computed per seasonal bucket.",
+    )
 show_volume = st.sidebar.checkbox(
     "Overlay request volume", value=False,
     help="Adds a secondary axis showing raw request volume, so you can see at a glance whether "
@@ -113,12 +165,12 @@ show_volume = st.sidebar.checkbox(
 st.sidebar.markdown("---")
 
 scan_clicked = st.sidebar.button(
-    "🔍 Scan for Anomalies", type="primary",
+    "🔍 Scan for Anomalies", type="primary", key="scan_button",
     help="Runs the full trigger scan + culprit ranking against the selected table.",
 )
 
 if st.sidebar.button(
-    "♻️ Clear cached queries",
+    "♻️ Clear cached queries", key="clear_cache_button",
     help="Forces every drill-down and LLM report to re-run instead of serving a cached result. "
          "Also the only way to get a fresh Langfuse trace for something already on screen.",
 ):
@@ -126,7 +178,7 @@ if st.sidebar.button(
     st.toast("Drill-down cache cleared.")
 
 if st.sidebar.button(
-    "🆕 Start new session",
+    "🆕 Start new session", key="new_session_button",
     help="Resets scan results and mints a new Langfuse session id, without needing a hard "
          "browser refresh or process restart. Annotations you've saved are unaffected — "
          "those are stored durably, not tied to a session.",
@@ -143,7 +195,7 @@ with st.sidebar.expander("🤖 LLM model", expanded=False):
         "Groq disables models per project, so the app asks your account what it will "
         "serve and picks the smallest chat model. Override here if you want a specific one."
     )
-    if st.button("Refresh model list", width="stretch"):
+    if st.button("Refresh model list", key="refresh_models_button", width="stretch"):
         ok, result = list_models()
         if ok:
             st.session_state["groq_models"] = chat_models(result)
@@ -165,7 +217,7 @@ with st.sidebar.expander("🤖 LLM model", expanded=False):
     st.caption(f"Active: `{active}`" if active else "Active: placeholder (no model available)")
 
 with st.sidebar.expander("📡 Langfuse tracing", expanded=False):
-    recheck = st.button("Re-check connection", width="stretch")
+    recheck = st.button("Re-check connection", key="recheck_langfuse_button", width="stretch")
     status = langfuse_status(force=recheck)
     if status["active"]:
         st.success(f"Tracing active → {status['base_url']}")
@@ -216,16 +268,22 @@ st.sidebar.markdown(
 st.markdown(
     f"""
     <style>
+    /* Space Grotesk stands in for ClickHouse's own display face, Basier
+       Square — that one is a commercial/licensed font with no public CDN
+       source, so this is a close-in-spirit substitute, not the real thing. */
+    @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&display=swap');
+
     .heimdall-eyebrow {{
         font-size: 0.75rem; font-weight: 600; letter-spacing: 0.12em;
-        text-transform: uppercase; color: #6c757d; margin-bottom: 0.15rem;
+        text-transform: uppercase; color: #FAFF69; margin-bottom: 0.15rem;
     }}
     .heimdall-title {{
+        font-family: 'Space Grotesk', sans-serif;
         font-size: 2.1rem; font-weight: 700; letter-spacing: -0.01em;
-        margin: 0; line-height: 1.15;
+        margin: 0; line-height: 1.15; color: #F2F2F0;
     }}
     .heimdall-tagline {{
-        font-size: 1rem; font-style: italic; color: #6c757d; margin-top: 0.2rem;
+        font-size: 1rem; font-style: italic; color: #9AA0A6; margin-top: 0.2rem;
     }}
     .heimdall-bridge {{
         height: 4px; border-radius: 2px; margin: 0.9rem 0 1.1rem 0;
@@ -260,8 +318,8 @@ if scan_clicked:
             with lft.traced_root(
                 "anomaly-scan",
                 input={"grain": grain.key, "z_threshold": z_threshold,
-                      "dispersion_ratio_threshold": dispersion_ratio_threshold,
-                      "min_dispersion": min_dispersion},
+                      "min_contribution_share": min_contribution_share,
+                      "min_volume_share": min_volume_share},
             ) as scan_span:
                 with lft.traced("scan.trigger_scan", input={"grain": grain.key}) as span:
                     trigger_df = step1_trigger_scan(client, grain)
@@ -278,8 +336,8 @@ if scan_clicked:
                         ) as span:
                             v = build_verdict(
                                 client, metric, window_values, grain,
-                                dispersion_ratio_threshold=dispersion_ratio_threshold,
-                                min_dispersion=min_dispersion,
+                                min_contribution_share=min_contribution_share,
+                                min_volume_share=min_volume_share,
                             )
                             if v:
                                 span.update(output={
@@ -400,19 +458,29 @@ fig = make_subplots(
 curve_metric = []
 
 for i, metric in enumerate(METRIC_ORDER, start=1):
-    # detection band: the +/- z_threshold * sigma corridor the scan actually uses
+    # Detection band — now drawn per-row rather than as one flat ribbon,
+    # because the baseline itself is seasonal: a Tuesday's normal range is
+    # no longer the same number as a Saturday's. Two styles available:
+    #   Percentile: literal P10/P90 of that row's own seasonal bucket —
+    #     makes no distributional assumption, robust to skew.
+    #   Parametric: mean ± z·σ of that row's own seasonal bucket — matches
+    #     exactly what the trigger scan's z-score is computed against.
     if show_band and f"{metric}_mean" in trigger_df.columns:
-        mean = float(trigger_df[f"{metric}_mean"].iloc[0])
-        std = float(trigger_df[f"{metric}_std"].iloc[0])
-        lo, hi = mean - z_threshold * std, mean + z_threshold * std
+        if band_style.startswith("Percentile"):
+            lo_series = trigger_df[f"{metric}_p10"]
+            hi_series = trigger_df[f"{metric}_p90"]
+        else:
+            lo_series = trigger_df[f"{metric}_mean"] - z_threshold * trigger_df[f"{metric}_std"]
+            hi_series = trigger_df[f"{metric}_mean"] + z_threshold * trigger_df[f"{metric}_std"]
+
         fig.add_trace(
-            go.Scatter(x=trigger_df["t"], y=[lo] * len(trigger_df), mode="lines",
+            go.Scatter(x=trigger_df["t"], y=lo_series, mode="lines",
                        line=dict(width=0), hoverinfo="skip", showlegend=False),
             row=i, col=1, secondary_y=False,
         )
         curve_metric.append(None)
         fig.add_trace(
-            go.Scatter(x=trigger_df["t"], y=[hi] * len(trigger_df), mode="lines",
+            go.Scatter(x=trigger_df["t"], y=hi_series, mode="lines",
                        line=dict(width=0), fill="tonexty", fillcolor="rgba(69,123,157,0.10)",
                        hoverinfo="skip", showlegend=False),
             row=i, col=1, secondary_y=False,
@@ -429,8 +497,16 @@ for i, metric in enumerate(METRIC_ORDER, start=1):
                 size=[10 if a else 5 for a in is_anom],
             ),
             line=dict(color="#457b9d"),
-            customdata=trigger_df[f"{metric}_z"],
-            hovertemplate="%{x}<br>%{y:.4f}<br>z = %{customdata:.2f}<extra></extra>",
+            customdata=np.stack([
+                trigger_df[f"{metric}_z"], trigger_df[f"{metric}_p90"],
+                trigger_df[f"{metric}_p95"], trigger_df[f"{metric}_p99"],
+                trigger_df["bucket_n"],
+            ], axis=-1),
+            hovertemplate=(
+                "%{x}<br>%{y:.4f}<br>z = %{customdata[0]:.2f}<br>"
+                "P90/P95/P99 (this bucket): %{customdata[1]:.2f} / %{customdata[2]:.2f} / "
+                "%{customdata[3]:.2f}<br>bucket sample size: %{customdata[4]}<extra></extra>"
+            ),
         ),
         row=i, col=1, secondary_y=False,
     )
@@ -462,9 +538,40 @@ trend_event = st.plotly_chart(
 )
 st.caption(
     "Red markers = flagged points (|z| above threshold). Shaded band = the grouped incident "
-    "window. The pale corridor is the ±z·σ detection band — anything outside it flags. "
-    "**Click any point to inspect that bucket.**"
+    "window. The pale corridor is the **seasonal** normal range — computed per weekday (Daily) "
+    "or per weekday+hour (Hourly) where there's enough history, so a normal Saturday no longer "
+    "gets compared against a Tuesday's average. **Click any point to inspect that bucket.**"
 )
+
+if "baseline_tier" in trigger_df.columns:
+    tier_counts = trigger_df["baseline_tier"].value_counts()
+    n_seasonal = int(tier_counts.get("seasonal", 0))
+    n_daytype = int(tier_counts.get("day_type", 0))
+    n_flat = int(tier_counts.get("flat", 0))
+    total_buckets = len(trigger_df)
+
+    if n_daytype or n_flat:
+        parts = []
+        if n_daytype:
+            parts.append(f"{n_daytype} bucket(s) fell back to a coarser weekday-vs-weekend "
+                         "baseline (not enough history yet for the full weekday split)")
+        if n_flat:
+            parts.append(f"{n_flat} bucket(s) fell all the way back to a flat, whole-period "
+                         "baseline (not enough history for weekday-vs-weekend either) — these "
+                         "are the least reliable rows on the chart, since a flat baseline is "
+                         "still mixed with real seasonality it can't separate out")
+        st.caption(
+            f"📊 Baseline used: {n_seasonal}/{total_buckets} bucket(s) at full seasonal precision. "
+            + "; ".join(parts) + "."
+        )
+    min_bucket_n = int(trigger_df["bucket_n"].min())
+    if min_bucket_n < 20:
+        st.caption(
+            f"⚠️ The smallest fully-seasonal bucket has only **{min_bucket_n}** historical points "
+            "behind it. With this few samples, P95/P99 are close to just the bucket's max — "
+            "informative for a quick look, not a number to cite precisely. More history makes "
+            "every tier above more reliable, especially on Hourly (up to 168 buckets vs Daily's 7)."
+        )
 
 points = dd._selected_points(trend_event)
 if points:
@@ -568,31 +675,40 @@ for idx, v in enumerate(visible):
         ]
 
         with left:
-            st.markdown("**Dispersion ranking across all dimensions**")
+            st.markdown("**Culprit ranking — contribution share across all dimensions**")
             st.caption(
-                "Bigger bar = that dimension's values disagreed more with each other → more likely "
-                "the cause. A dimension where every value moved together is ruled out. "
+                "Bigger bar = more of the total observed change is explained by that "
+                "dimension's single best value. Fixed from an earlier version that ranked "
+                "by dispersion (how spread-out a dimension's values were) — that approach "
+                "favored low-cardinality dimensions with a mild mix-shift over a "
+                "high-cardinality dimension with one genuinely broken value. "
                 "**Click a bar to open that dimension.**"
             )
+            chart_df = ranking_df.sort_values("top_contribution_share", ascending=True).copy()
+            chart_df["display_label"] = chart_df["dimension_name"].where(
+                chart_df["dimension_name"] != "country", "country 🗺️"
+            )
             bar_fig = px.bar(
-                ranking_df.sort_values("dispersion", ascending=True),
-                x="dispersion", y="dimension_name", orientation="h",
+                chart_df,
+                x="top_contribution_share", y="display_label", orientation="h",
                 color="status",
                 color_discrete_map={"Culprit": "#e63946", "Ruled out": "#2a9d8f"},
-                text="dispersion",
-                custom_data=["min_ratio", "max_ratio", "spread"],
+                text="top_contribution_share",
+                custom_data=["top_value", "top_ratio", "dispersion"],
             )
             bar_fig.update_traces(
-                texttemplate="%{text:.4f}", textposition="outside",
+                texttemplate="%{text:.3f}", textposition="outside",
                 hovertemplate=(
-                    "<b>%{y}</b><br>Dispersion: %{x:.4f}<br>"
-                    "Ratio range: %{customdata[0]:.2f}x – %{customdata[1]:.2f}x<br>"
-                    "Spread: %{customdata[2]:.4f}<extra></extra>"
+                    "<b>%{y}</b><br>Top value: %{customdata[0]}<br>"
+                    "Contribution share: %{x:.3f}<br>"
+                    "That value's own ratio: %{customdata[1]:.3f}x<br>"
+                    "Dispersion (legacy stat, no longer the decision criterion): %{customdata[2]:.4f}"
+                    "<extra></extra>"
                 ),
             )
             bar_fig.update_layout(
                 height=350, margin=dict(l=10, r=10, t=10, b=10),
-                xaxis_title="Dispersion (higher = more suspicious)", yaxis_title="",
+                xaxis_title="Contribution share (higher = more suspicious)", yaxis_title="",
                 clickmode="event+select",
             )
             bar_event = st.plotly_chart(
@@ -629,7 +745,22 @@ for idx, v in enumerate(visible):
         window_values = dd._parse_window(v["window"], grain)
         bar_points = dd._selected_points(bar_event)
         default_dim = v.get("culprit_dimension") or (ranking_df["dimension_name"].iloc[0] if not ranking_df.empty else None)
-        picked_dim = bar_points[0].get("y") if bar_points else default_dim
+        has_country = "country" in ranking_df["dimension_name"].values
+
+        jump_col, _ = st.columns([1, 3])
+        with jump_col:
+            if has_country and st.button(
+                "🗺️ Jump to country map", key=f"jump_map_{idx}",
+                help="Opens the country dimension directly, regardless of which bar is "
+                     "currently selected above — the map only ever appears for `country`, "
+                     "and is easy to miss if the culprit was a different dimension.",
+            ):
+                st.session_state[f"picked_dim_{idx}"] = "country"
+
+        if bar_points:
+            clicked = str(bar_points[0].get("y", "")).replace(" 🗺️", "").strip()
+            st.session_state[f"picked_dim_{idx}"] = clicked or default_dim
+        picked_dim = st.session_state.get(f"picked_dim_{idx}", default_dim)
 
         if picked_dim:
             with st.container(border=True):

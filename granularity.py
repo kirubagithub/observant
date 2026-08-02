@@ -87,11 +87,40 @@ def load_grains() -> dict:
 #   hourly: (weekday, hour) pair      -> (toDayOfWeek(time_col), toHour(time_col))
 # ---------------------------------------------------------------------------
 
-def seasonal_key_expr(grain: Grain) -> str:
-    """SQL expression computing this row's seasonal key."""
+def seasonal_key_expr(grain: Grain, column: str | None = None) -> str:
+    """SQL expression computing this row's seasonal key.
+
+    `column` overrides which column name the expression is built against.
+    Needed whenever the caller has already aliased the time column to
+    something else (e.g. step1_trigger_scan renames it to `t` inside a CTE) —
+    without this, the expression would reference the ORIGINAL column name,
+    which no longer exists in that query's scope, and ClickHouse fails with
+    "Unknown expression or function identifier". Defaults to grain.time_col
+    for callers querying the raw table directly (e.g. incident_headline).
+    """
+    col = column or grain.time_col
     if grain.is_datetime:
-        return f"(toDayOfWeek({grain.time_col}), toHour({grain.time_col}))"
-    return f"toDayOfWeek({grain.time_col})"
+        return f"(toDayOfWeek({col}), toHour({col}))"
+    return f"toDayOfWeek({col})"
+
+
+def day_type_key_expr(grain: Grain, column: str | None = None) -> str:
+    """Coarse seasonal key: weekday vs weekend only, ignoring hour-of-day
+    even for the hourly grain.
+
+    Exists as a middle fallback tier between the full seasonal key (7 or up
+    to 168 buckets — precise, but needs real history per bucket) and no
+    seasonality at all (1 bucket — always stable, but its variance is
+    contaminated by real weekend seasonality it never separates out, which
+    is the exact problem seasonal partitioning exists to fix in the first
+    place). A weekday/weekend split only needs ~n/2 samples per bucket to
+    stabilize instead of ~n/7 (daily) or ~n/168 (hourly), so it can engage
+    on far shorter history while still isolating the single biggest seasonal
+    effect the dataset glossary names — weekends being lower.
+    """
+    col = column or grain.time_col
+    return f"toDayOfWeek({col}) IN (6, 7)"
+
 
 
 def seasonal_keys_for_window(grain: Grain, window_values) -> list:

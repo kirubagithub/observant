@@ -13,3 +13,6 @@ python-dotenv>=1.0,<2.0
 # older, use LANGFUSE_HOST instead.
 openai>=2.0,<3.0
 langfuse>=4.0,<5.0
+
+# Country choropleth mapping (alpha-2 -> alpha-3 for Plotly's built-in map)
+pycountry>=23.12,<25.0

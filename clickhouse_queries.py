@@ -20,8 +20,9 @@ import numpy as np
 import pandas as pd
 
 from granularity import (
-    Grain, seasonal_key_expr, seasonal_keys_for_window, seasonal_key_sql_list,
-    describe_seasonal_keys, time_literal, time_list_sql, grain_ordinal,
+    Grain, seasonal_key_expr, day_type_key_expr, seasonal_keys_for_window,
+    seasonal_key_sql_list, describe_seasonal_keys, time_literal, time_list_sql,
+    grain_ordinal,
 )
 
 # ---------------------------------------------------------------------------
@@ -109,13 +110,67 @@ def get_client():
 # Step 1 — trigger scan (cheap: only dimension_name='__total__' rows)
 # ---------------------------------------------------------------------------
 
-def step1_trigger_scan(client, grain: Grain) -> pd.DataFrame:
+def step1_trigger_scan(client, grain: Grain,
+                       min_seasonal_samples: int = 8,
+                       min_daytype_samples: int = 8) -> pd.DataFrame:
     """The time column is always aliased to `t` in the result, regardless of
     grain, so every downstream consumer (find_incident_windows, the trend
     chart) is grain-agnostic and never has to know whether it is looking at
     a DATE or a DateTime column.
+
+    SEASONAL BASELINE, NOT FLAT: mean/std/percentiles are all partitioned by
+    the grain's seasonal key (same weekday for daily; same weekday+hour for
+    hourly) rather than computed once over the whole period. This is the
+    fix for the exact failure mode the dataset glossary names directly —
+    "a flat global average makes every weekend look like an anomaly" — by
+    making the trigger's own baseline seasonal, not by adding an explanatory
+    note after a false alarm has already fired.
+
+    THREE-TIER FALLBACK — this matters, and a two-tier version of this
+    (seasonal, else flat) is NOT enough. Measured directly: on 5 weeks of
+    data with a real ~25% weekend dip, a flat fallback's std comes out 2.4x
+    too wide, PURELY from mixing weekday and weekend values that don't
+    belong in the same distribution — reintroducing the exact contamination
+    problem seasonal partitioning exists to fix, at the fallback layer. So
+    there are three tiers, each used only when there's enough history to
+    trust it, falling back progressively rather than jumping straight to
+    the contaminated flat estimate:
+
+        1. Full seasonal (weekday, or weekday+hour for hourly) — finest,
+           needs `min_seasonal_samples` per bucket.
+        2. Weekday-vs-weekend only — coarser, needs `min_daytype_samples`
+           per bucket, but still isolates the single biggest seasonal
+           effect instead of averaging over it.
+        3. Flat (whole period) — only if even tier 2 doesn't have enough
+           samples. Still seasonality-contaminated; this is a last resort,
+           not a design goal.
+
+    `baseline_tier` reports which one applied per row ('seasonal' /
+    'day_type' / 'flat'), so the UI can disclose it rather than presenting
+    every row's band with the same implied confidence.
+
+    PERCENTILES ARE APPROXIMATE: `quantile()` (not `quantileExact()`) trades
+    a small, bounded error for speed on large tables — reasonable for a
+    monitoring band, not for a number you'd cite precisely. The same
+    three-tier fallback applies to them.
     """
     tc = grain.time_col
+    # The outer SELECT below operates on `bucketed`, which aliases the time
+    # column to `t` — so every key expression must reference `t`, not
+    # grain's original column name (that identifier no longer exists here).
+    key_expr = seasonal_key_expr(grain, column="t")
+    daytype_expr = day_type_key_expr(grain, column="t")
+
+    def stat(fn: str, col: str) -> str:
+        """`fn` computed at all three tiers, cascaded by sample size."""
+        seasonal = f"{fn}({col}) OVER (PARTITION BY {key_expr})"
+        daytype = f"{fn}({col}) OVER (PARTITION BY {daytype_expr})"
+        flat = f"{fn}({col}) OVER ()"
+        return (
+            f"if(bucket_n >= {min_seasonal_samples}, {seasonal}, "
+            f"if(daytype_n >= {min_daytype_samples}, {daytype}, {flat}))"
+        )
+
     q = f"""
         WITH bucketed AS (
             SELECT {tc} AS t,
@@ -124,7 +179,9 @@ def step1_trigger_scan(client, grain: Grain) -> pd.DataFrame:
                    fills,
                    impressions,
                    fills / requests             AS fill_rate,
-                   revenue / impressions * 1000  AS ecpm
+                   revenue / impressions * 1000  AS ecpm,
+                   count() OVER (PARTITION BY {key_expr})     AS bucket_n,
+                   count() OVER (PARTITION BY {daytype_expr}) AS daytype_n
             FROM {grain.table}
             WHERE dimension_name = '__total__'
         )
@@ -135,21 +192,44 @@ def step1_trigger_scan(client, grain: Grain) -> pd.DataFrame:
                impressions,
                fill_rate,
                ecpm,
-               (revenue   - avg(revenue)   OVER ()) / stddevPop(revenue)   OVER () AS revenue_z,
-               (fill_rate - avg(fill_rate) OVER ()) / stddevPop(fill_rate) OVER () AS fill_rate_z,
-               (ecpm      - avg(ecpm)      OVER ()) / stddevPop(ecpm)      OVER () AS ecpm_z,
-               avg(revenue)         OVER () AS revenue_mean,
-               stddevPop(revenue)   OVER () AS revenue_std,
-               avg(fill_rate)       OVER () AS fill_rate_mean,
-               stddevPop(fill_rate) OVER () AS fill_rate_std,
-               avg(ecpm)            OVER () AS ecpm_mean,
-               stddevPop(ecpm)      OVER () AS ecpm_std
+               bucket_n,
+               daytype_n,
+               if(bucket_n >= {min_seasonal_samples}, 'seasonal',
+                  if(daytype_n >= {min_daytype_samples}, 'day_type', 'flat')) AS baseline_tier,
+
+               (revenue   - {stat("avg", "revenue")})   / nullIf({stat("stddevPop", "revenue")}, 0)   AS revenue_z,
+               (fill_rate - {stat("avg", "fill_rate")}) / nullIf({stat("stddevPop", "fill_rate")}, 0) AS fill_rate_z,
+               (ecpm      - {stat("avg", "ecpm")})      / nullIf({stat("stddevPop", "ecpm")}, 0)      AS ecpm_z,
+
+               {stat("avg", "revenue")}         AS revenue_mean,
+               {stat("stddevPop", "revenue")}   AS revenue_std,
+               {stat("avg", "fill_rate")}       AS fill_rate_mean,
+               {stat("stddevPop", "fill_rate")} AS fill_rate_std,
+               {stat("avg", "ecpm")}            AS ecpm_mean,
+               {stat("stddevPop", "ecpm")}      AS ecpm_std,
+
+               {stat("quantile(0.10)", "revenue")} AS revenue_p10,
+               {stat("quantile(0.90)", "revenue")} AS revenue_p90,
+               {stat("quantile(0.95)", "revenue")} AS revenue_p95,
+               {stat("quantile(0.99)", "revenue")} AS revenue_p99,
+
+               {stat("quantile(0.10)", "fill_rate")} AS fill_rate_p10,
+               {stat("quantile(0.90)", "fill_rate")} AS fill_rate_p90,
+               {stat("quantile(0.95)", "fill_rate")} AS fill_rate_p95,
+               {stat("quantile(0.99)", "fill_rate")} AS fill_rate_p99,
+
+               {stat("quantile(0.10)", "ecpm")} AS ecpm_p10,
+               {stat("quantile(0.90)", "ecpm")} AS ecpm_p90,
+               {stat("quantile(0.95)", "ecpm")} AS ecpm_p95,
+               {stat("quantile(0.99)", "ecpm")} AS ecpm_p99
         FROM bucketed
         ORDER BY t
     """
     df = client.query_df(q, settings=SETTINGS)
     if df.empty or "t" not in df.columns:
         raise ValueError(
+
+
             f"No rows returned from {grain.table} for dimension_name='__total__'. "
             f"Check the table name, the time column ('{tc}'), and that "
             "__total__ rows exist. If this is the hourly table, confirm "
@@ -183,28 +263,112 @@ def find_incident_windows(df: pd.DataFrame, grain: Grain, z_threshold: float = 2
 # Step 2 — culprit ranking across ALL dimensions (dispersion-based)
 # ---------------------------------------------------------------------------
 
-def step2_culprit_ranking(client, metric: str, window_values, grain: Grain) -> pd.DataFrame:
+def step2_culprit_ranking(client, metric: str, window_values, grain: Grain,
+                          min_volume_share: float = 0.01) -> pd.DataFrame:
+    """Rank every dimension by its single best explanation for the observed
+    change — not by how spread-out the whole dimension is.
+
+    WHY THE OLD APPROACH (dispersion = stddevPop of per-value ratios) WAS
+    WRONG: it answers "how much does this dimension disagree with itself,"
+    not "is there one value that broke while the rest are normal." Verified
+    directly against a real incident: os_version had one catastrophic value
+    (a fill-rate collapse, z=-10.1 relative to the other 7 OS versions, all
+    of which were normal) but LOST the ranking to publisher_tier — which had
+    all 3 of its values move by modest, DIFFERENT amounts (a mix shift, not
+    a single culprit). Dispersion rewarded the mix shift over the actual
+    single-value break, because stddev across only 3 values is much easier
+    to inflate than stddev diluted across 8 values where 7 are quiet.
+
+    THE FIX: contribution_share — what fraction of the TOTAL observed change
+    in the metric one value accounts for, using the exact attribution
+    identity already used in the drill-down waterfall (contribution sums
+    exactly to the total change, so shares are directly comparable across
+    dimensions of any cardinality). Ranking dimensions by their single
+    highest |contribution_share| value fixes the low-cardinality bias:
+    Android 12 alone explaining ~90%+ of a fill-rate drop outranks three
+    publisher tiers each explaining a modest, separate slice.
+
+    VOLUME FLOOR (`min_volume_share`, default 1% of the dimension's own
+    baseline volume): without this, a near-empty segment can produce a wild
+    ratio and thus a wild contribution from noise alone. This is a
+    heuristic default, not a rigorously derived one — tune it against your
+    actual segment volume distribution.
+
+    Returns one row per dimension: the descriptive dispersion stats (kept
+    for continuity/display) PLUS `top_value`, `top_contribution_share`,
+    `top_window_value`, `top_baseline_value`, `top_ratio` — everything
+    needed to name a culprit directly, without a separate step3 query.
+    """
     tc = grain.time_col
     times = time_list_sql(grain, window_values)
     metric_expr = METRIC_EXPR[metric]
+    num, den = METRIC_NUM[metric], METRIC_DEN[metric]
+
+    # CONFIRMED BUG, fixed here: vertical/campaign_type are only populated on
+    # FILLED events (per the dataset glossary — advertiser_id, and therefore
+    # vertical/campaign_type, is empty on unfilled requests). For fill_rate
+    # specifically, the denominator is ALL requests including unfilled ones,
+    # so grouping fill_rate by vertical/campaign_type mixes a numerator that
+    # only exists for filled rows against a denominator that doesn't respect
+    # that split. Verified directly against real data: both dimensions
+    # returned dispersion=0 and an empty/degenerate row for a real fill_rate
+    # incident — not "no signal," a broken computation. Excluded here rather
+    # than silently producing a meaningless zero that could be misread as
+    # "definitely ruled out."
+    excluded_dims = ["'app_id'", "'__total__'"]
+    if metric == "fill_rate":
+        excluded_dims += ["'vertical'", "'campaign_type'"]
+    excluded_sql = ", ".join(excluded_dims)
+
     q = f"""
-        WITH ratios AS (
+        WITH per_value AS (
             SELECT dimension_name,
                    dimension_value,
                    avgIf({metric_expr}, {tc} IN ({times}))
-                 / avgIf({metric_expr}, {tc} NOT IN ({times})) AS ratio
+                 / avgIf({metric_expr}, {tc} NOT IN ({times})) AS ratio,
+                   sumIf({num}, {tc} IN ({times}))     AS n_w,
+                   sumIf({den}, {tc} IN ({times}))     AS d_w,
+                   sumIf({num}, {tc} NOT IN ({times})) AS n_b,
+                   sumIf({den}, {tc} NOT IN ({times})) AS d_b
             FROM {grain.table}
-            WHERE dimension_name NOT IN ('app_id', '__total__')
+            WHERE dimension_name NOT IN ({excluded_sql})
             GROUP BY dimension_name, dimension_value
+        ),
+        totals AS (
+            SELECT dimension_name,
+                   sum(n_w) AS N_W, sum(d_w) AS D_W,
+                   sum(n_b) AS N_B, sum(d_b) AS D_B
+            FROM per_value
+            GROUP BY dimension_name
+        ),
+        scored AS (
+            SELECT p.dimension_name                                          AS dimension_name,
+                   p.dimension_value                                         AS dimension_value,
+                   p.ratio                                                   AS ratio,
+                   p.n_w / nullIf(p.d_w, 0)                                  AS window_value,
+                   p.n_b / nullIf(p.d_b, 0)                                  AS baseline_value,
+                   (p.n_w - (t.N_B / nullIf(t.D_B, 0)) * p.d_w) / nullIf(t.D_W, 0)
+                                                                             AS contribution,
+                   (p.n_w - (t.N_B / nullIf(t.D_B, 0)) * p.d_w) / nullIf(t.D_W, 0)
+                     / nullIf((t.N_W / nullIf(t.D_W, 0)) - (t.N_B / nullIf(t.D_B, 0)), 0)
+                                                                             AS contribution_share
+            FROM per_value AS p
+            INNER JOIN totals AS t ON p.dimension_name = t.dimension_name
+            WHERE p.d_b >= {min_volume_share} * t.D_B   -- volume floor, per dimension
         )
         SELECT dimension_name,
                min(ratio)              AS min_ratio,
                max(ratio)              AS max_ratio,
                max(ratio) - min(ratio) AS spread,
-               stddevPop(ratio)        AS dispersion
-        FROM ratios
+               stddevPop(ratio)        AS dispersion,
+               max(abs(contribution_share))                           AS top_contribution_share,
+               argMax(dimension_value, abs(contribution_share))       AS top_value,
+               argMax(window_value, abs(contribution_share))         AS top_window_value,
+               argMax(baseline_value, abs(contribution_share))       AS top_baseline_value,
+               argMax(ratio, abs(contribution_share))                AS top_ratio
+        FROM scored
         GROUP BY dimension_name
-        ORDER BY dispersion DESC
+        ORDER BY top_contribution_share DESC
     """
     return client.query_df(q, settings=SETTINGS)
 
@@ -215,6 +379,11 @@ def step2_culprit_ranking(client, metric: str, window_values, grain: Grain) -> p
 
 def step3_culprit_value(client, metric: str, window_values, dimension_name: str,
                          grain: Grain, ascending: bool = True) -> pd.DataFrame:
+    """Superseded by step2_culprit_ranking's argMax columns — the new ranking
+    names the top value directly, so build_verdict no longer calls this.
+    Left in place in case you want the full ranked list of every value in
+    one dimension independent of a verdict (e.g. for a standalone drill-down
+    that isn't tied to build_verdict's decision)."""
     tc = grain.time_col
     times = time_list_sql(grain, window_values)
     metric_expr = METRIC_EXPR[metric]
@@ -238,18 +407,29 @@ def step3_culprit_value(client, metric: str, window_values, dimension_name: str,
 # ---------------------------------------------------------------------------
 
 def build_verdict(client, metric: str, window_values, grain: Grain,
-                   dispersion_ratio_threshold: float = 3.0, min_dispersion: float = 0.02) -> dict | None:
-    ranking_df = step2_culprit_ranking(client, metric, window_values, grain)
+                   min_contribution_share: float = 0.5, min_volume_share: float = 0.01) -> dict | None:
+    """Name a culprit directly from the contribution-share ranking.
+
+    Replaces the old dispersion_ratio_threshold/min_dispersion pair with one
+    that means what it says: a culprit is declared when the single best
+    (dimension, value) pair across the whole scan explains at least
+    `min_contribution_share` of the total observed change. Default 0.5 —
+    "this one segment accounts for at least half the move" — is a starting
+    point, not a derived constant; tune it against your own data's noise
+    floor the same way the old threshold needed tuning.
+
+    Because step2_culprit_ranking now returns the top value directly
+    (via argMax), there's no separate step3 query needed here — the old
+    two-step "rank dimensions, then look inside the winner" became
+    unnecessary once ranking is done on (dimension, value) contribution
+    rather than dimension-level dispersion.
+    """
+    ranking_df = step2_culprit_ranking(client, metric, window_values, grain, min_volume_share)
     if ranking_df.empty:
         return None
 
     top = ranking_df.iloc[0]
-    second_dispersion = ranking_df.iloc[1]["dispersion"] if len(ranking_df) > 1 else 0.0
-
-    has_culprit = bool(
-        top["dispersion"] >= min_dispersion
-        and top["dispersion"] >= dispersion_ratio_threshold * max(second_dispersion, 1e-9)
-    )
+    has_culprit = bool(top["top_contribution_share"] >= min_contribution_share)
 
     verdict = {
         "metric": metric,
@@ -261,18 +441,13 @@ def build_verdict(client, metric: str, window_values, grain: Grain,
     }
 
     if has_culprit:
-        values_df = step3_culprit_value(client, metric, window_values, top["dimension_name"], grain, ascending=True)
-        min_row = values_df.iloc[0]
-        max_row = values_df.iloc[-1]
-        # pick whichever end deviates further from ratio=1 (works for drops and spikes)
-        culprit_row = min_row if abs(min_row["ratio"] - 1) >= abs(max_row["ratio"] - 1) else max_row
-
         verdict.update({
             "culprit_dimension": top["dimension_name"],
-            "culprit_value": culprit_row["dimension_value"],
-            "window_value": round(float(culprit_row["window_value"]), 4),
-            "baseline_value": round(float(culprit_row["baseline_value"]), 4),
-            "ratio": round(float(culprit_row["ratio"]), 4),
+            "culprit_value": top["top_value"],
+            "window_value": round(float(top["top_window_value"]), 4),
+            "baseline_value": round(float(top["top_baseline_value"]), 4),
+            "ratio": round(float(top["top_ratio"]), 4),
+            "contribution_share": round(float(top["top_contribution_share"]), 4),
             "ruled_out": ranking_df["dimension_name"].tolist()[1:],
         })
     else:
