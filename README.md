@@ -1,49 +1,90 @@
-# InMobi Anomaly & Culprit Scanner (Streamlit)
+# Team Name
+## Data Heimdall
 
-Dockerized Streamlit app that:
+## Track
+InMobi
 
-1. Runs the **trigger scan** SQL against `dimension_name='__total__'` in
-   `ad_events_daily_agg` to find days where revenue / fill_rate / eCPM
-   moved beyond a z-score threshold.
-2. For each flagged window, runs the **dispersion-ranking** SQL across
-   every other dimension (`country`, `os_version`, `category`, `ad_format`,
-   `device_model`, `region`, `publisher_tier`, `campaign_type`, `vertical`)
-   to find which one, if any, is the culprit.
-3. Names the exact **culprit value** (e.g. `os_version = Android 15`).
-4. Renders everything — trend charts, dispersion bar charts, gauges, a
-   summary table, and the small JSON verdict — directly on the page.
-5. Calls a **stub LLM function** (`llm_stub.generate_llm_diagnosis`) per
-   incident and prints whatever string it returns as page content. Replace
-   that function's body with your own LLM API call — you don't need to
-   touch anything else in the app.
+## Project
+**Observant** — sees the metric move, automatically finds the exact segment responsible, and explains it in plain language with every number traced back to a query.
 
-All statistics (z-scores, ratios, dispersion) are computed in ClickHouse
-SQL, not in Python/pandas. The Python layer only orchestrates queries and
-renders results.
+## Team Members
+- [Kirubanandhan N] ([GitHub handle: kirubagithub])
+- Senthilkumar Sukumar ([GithHub handle: senthilkumar3282])
+- [Thejasekhar Reddy Gundlooru] ([GithHub handle: ThejaReddy1]) 
+- [Vijayan Jaybal] ([GithHub handle: VijayanJ])
 
-## Run with Docker Compose (recommended)
+## What it does
+Observant is a ClickHouse-native root-cause analyst for ad-tech metrics. It:
+1. **Detects** when a key metric (requests, revenue, fill rate, CTR, eCPM) deviates from its expected baseline, using a same-weekday-median baseline (to avoid mistaking ordinary weekly seasonality for an anomaly) and a regression-residual z-score method that catches both sharp single-day spikes and borderline multi-day drifts.
+2. **Localizes** the anomaly automatically across every available dimension — region, country, OS version, device model, ad format, publisher tier, app category, advertiser vertical, campaign type — ranking segments by how disproportionately they moved relative to their peers, not just by raw volume.
+3. **Cross-checks confounds** before naming a culprit — e.g. confirming a fill-rate collapse localized to one OS version isn't actually a region effect wearing an OS disguise, by testing the segment's behavior independently across every other dimension.
+4. **Reports in plain language**, with every claim backed by a specific computed number, and an explicit "checked and ruled out" section — not just what was found, but what was tested and cleared.
 
+**Confirmed findings on the InMobi dataset** (validated end-to-end, every number traced to a query):
+- **2026-06-21**: Global request/revenue crash (−44% to −45%), uniform across every dimension — a pure demand-side event, not a monetization problem.
+- **2026-06-23 to 06-25**: Fill-rate collapse localized to `os_version='Android 15'` (0.785 → 0.433, ≈−28,400 fills) — a blended ~−4.4% move at the platform level that only reveals its true concentration once localized past ad_format.
+- **2026-06-19 to 06-22**: eCPM collapse localized to `category='finance'` apps (−34.9%, ≈−$42 revenue) — confirmed via independent cross-tabs against both region and advertiser vertical, ruling out both as confounds.
+- **2026-07-06 to 07-10 (new data)**: NAM-region eCPM/fill-rate collapse (−44.4% eCPM, ≈−$526 revenue; nested 2-day fill-rate crash, ≈−26,000 fills), confirmed region-driven (not OS- or device-driven) via a region×os_version cross-tab, and still unresolved as of the latest ingested data.
+
+## Hosted Demo
+[Data Heimdall](https://data-heimdall.streamlit.app/)
+
+## Demo Video
+
+https://youtu.be/R-_2S3q4csk
+
+## Architecture
+
+![Architecture diagram](./Arch.png)
+
+**Key design principle: math lives in SQL, not Python.** The Python layer issues
+queries and renders results — it never computes a statistic itself. This
+means every number in a report is independently reproducible by re-running
+the query directly against ClickHouse, and the LLM's job is strictly
+translation (verdict JSON → sentence), never analysis or invention.
+
+**Detection method** evolved across iterations of this build: starting from
+Tukey-fence outlier detection on daily residuals, extended to a same-weekday
+median baseline (to defeat the "every weekend looks anomalous" failure
+mode), and finalized as an OLS trend-regression residual z-score — chosen
+because it surfaces borderline multi-day drifts (2–3σ) that a hard
+percentage-deviation cutoff silently discards, which is how the
+`category='finance'` and NAM-region incidents were actually caught.
+
+## How we built it
+
+**Tech stack:**
+- **ClickHouse Cloud** — primary database and full compute engine (z-scores, dispersion ranking, cross-tab confound checks, all in SQL)
+- **Streamlit** — interactive front end: trend charts, dispersion bar charts, gauges, incident summary cards
+- **Docker / Docker Compose** — containerized deployment, environment-variable configuration (`CLICKHOUSE_HOST`, `PORT`, `USER`, `PASSWORD`, `DATABASE`, `SECURE`, `TABLE`)
+- **LLM (pluggable)** — a stub interface (`llm_stub.py`) that takes a small, pre-computed verdict JSON (no raw rows) and returns plain-language narration; swappable to any provider without touching the rest of the app
+- **Langfuse** — full observability: every ClickHouse query and every LLM call traced and session-grouped, satisfying the "no trace, no credit" evaluation requirement
+
+**Interesting implementation details:**
+- **Baseline discipline**: ratio metrics (fill rate, eCPM, CTR) are always computed as `sum/sum` over the group, never as an average of per-day ratios, per the metrics glossary.
+- **Confound-aware localization**: a segment isn't named as the culprit just because it has the largest raw deviation — it has to move disproportionately more than the *typical* segment in the same dimension (tunable dominance ratio, default 3.0x in the sidebar), and where possible its independence is verified with a cross-tab against at least one other dimension (e.g. confirming a fill-rate anomaly is really `os_version`-driven and not a `region` effect that happens to correlate with it).
+- **Multi-database routing awareness**: when new data lands in a differently-named database/table (e.g. `inmobi_cat` alongside the original `inmobi`), the pipeline was explicitly re-verified to detect and route to the freshest table rather than silently reporting "no anomaly" against stale data — a failure mode this project treats as a first-class risk, not an edge case.
+- **Explicit rule-outs, not just findings**: every report states what was checked and cleared (weekly seasonality, alternate dimensions, data-quality artifacts like `advertiser_id=''` on unfilled rows) alongside what was found.
+
+## How to run it
+
+### With Docker Compose (recommended)
 ```bash
 cp example.env .env
 # edit .env with your ClickHouse Cloud host / user / password / database
-
 docker compose up --build
 ```
+Open `http://localhost:8501`, click **Scan for Anomalies** in the sidebar.
 
-Open http://localhost:8501, click **Scan for Anomalies** in the sidebar.
-
-## Run with plain Docker
-
+### With plain Docker
 ```bash
 cp example.env .env
 # edit .env
-
 docker build -t inmobi-anomaly-scanner .
 docker run --rm -p 8501:8501 --env-file .env inmobi-anomaly-scanner
 ```
 
-## Run locally without Docker
-
+### Locally without Docker
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
@@ -51,107 +92,24 @@ cp example.env .env   # edit it
 streamlit run app.py
 ```
 
-## Use the provided schema to ingest data
+### Configuration
+All connection settings come from environment variables (`.env`, or injected by Docker/Compose):
 
-This repository includes `schemas.sql`, which creates the raw event table,
-lookup tables, dictionary sources, hourly and daily aggregate tables, and
-materialized views that populate those aggregates automatically.
+| Variable | Meaning | Default |
+|---|---|---|
+| `CLICKHOUSE_HOST` | ClickHouse Cloud host | `localhost` |
+| `CLICKHOUSE_PORT` | HTTPS port | `8443` |
+| `CLICKHOUSE_USER` | Username | `default` |
+| `CLICKHOUSE_PASSWORD` | Password | *(empty)* |
+| `CLICKHOUSE_DATABASE` | Database containing the agg table | `inmobi` |
+| `CLICKHOUSE_SECURE` | Use TLS (`true`/`false`) | `true` |
+| `CLICKHOUSE_TABLE` | Daily aggregate table name (editable in UI too) | `ad_events_daily_agg` |
 
-The basic ingestion flow is:
+Sidebar sliders (no restart needed): anomaly z-score threshold (default 2.0),
+culprit dominance ratio (default 3.0x), minimum dispersion floor (default 0.02).
 
-1. Create or choose the target ClickHouse database (for example `inmobi_cat`).
-2. Run the schema file against that database:
+**Before the unseen-incident release**: confirm `CLICKHOUSE_DATABASE` /
+`CLICKHOUSE_TABLE` point at wherever the fresh data actually lands — a
+hardcoded pointer at a stale database will silently report "no anomaly
+found" on the exact dataset being judged.
 
-```bash
-clickhouse-client \
-  --host "$CLICKHOUSE_HOST" --port "$CLICKHOUSE_PORT" \
-  --user "$CLICKHOUSE_USER" --password "$CLICKHOUSE_PASSWORD" \
-  --secure=1 \
-  --database "$CLICKHOUSE_DATABASE" \
-  < schemas.sql
-```
-
-3. Load raw event rows into `inmobi_cat.ad_events`.
-4. Populate the lookup tables: `inmobi_cat.apps`, `inmobi_cat.advertisers`, and
-   `inmobi_cat.geo_device`.
-5. The materialized views will aggregate those rows into
-   `inmobi_cat.ad_events_daily_agg` and `inmobi_cat.ad_events_hourly_agg`.
-
-If you already have your own aggregated table, set `CLICKHOUSE_TABLE` or
-`CLICKHOUSE_TABLE_DAILY` / `CLICKHOUSE_TABLE_HOURLY` to point the app at it.
-
-## Configuration
-
-All connection settings come from environment variables (loaded from `.env`
-via `python-dotenv`, or injected by Docker/Compose):
-
-| Variable                | Meaning                                        | Default              |
-|-------------------------|-----------------------------------------------|-----------------------|
-| `CLICKHOUSE_HOST`       | ClickHouse Cloud host                         | `localhost`           |
-| `CLICKHOUSE_PORT`       | HTTPS port                                    | `8443`                |
-| `CLICKHOUSE_USER`       | Username                                      | `default`             |
-| `CLICKHOUSE_PASSWORD`   | Password                                      | *(empty)*             |
-| `CLICKHOUSE_DATABASE`   | Database containing the agg table             | `inmobi`              |
-| `CLICKHOUSE_SECURE`     | Use TLS (`true`/`false`)                      | `true`                |
-| `CLICKHOUSE_TABLE`      | Daily aggregate table name (editable in UI too)| `ad_events_daily_agg` |
-| `CLICKHOUSE_TABLE_DAILY` | Daily aggregate table name used by the daily grain | `ad_events_daily_agg` |
-| `CLICKHOUSE_DAILY_TIME_COL` | Date column name for the daily table | `date` |
-| `CLICKHOUSE_TABLE_HOURLY` | Hourly aggregate table name used by the hourly grain | `ad_events_hourly_agg` |
-| `CLICKHOUSE_HOURLY_TIME_COL` | DateTime column name for the hourly table | `hour` |
-
-The sidebar can switch between Daily and Hourly grains. If you use the hourly table, set `CLICKHOUSE_TABLE_HOURLY` and `CLICKHOUSE_HOURLY_TIME_COL` in `.env` to match your schema.
-
-Notes:
-
-- `CLICKHOUSE_TABLE` is the default table name used by the daily grain unless `CLICKHOUSE_TABLE_DAILY` is set.
-- `CLICKHOUSE_TABLE_DAILY` and `CLICKHOUSE_DAILY_TIME_COL` explicitly configure the daily grain.
-- `CLICKHOUSE_TABLE_HOURLY` and `CLICKHOUSE_HOURLY_TIME_COL` explicitly configure the hourly grain.
-
-Sidebar sliders (no restart needed):
-
-- **Anomaly z-score threshold** — how extreme a day must be vs. the rest of
-  the period to count as an anomaly (default 2.0).
-- **Culprit dominance ratio** — how much higher the top dimension's
-  dispersion must be vs. the runner-up to call it a real culprit, not noise
-  (default 3.0x).
-- **Minimum dispersion to call a culprit** — floor below which even the top
-  dimension is considered "everything moved together" (default 0.02).
-
-## Where to plug in your own LLM call
-
-Open `llm_stub.py`. Everything you need is already built:
-
-- `build_prompt(verdict)` turns the verdict JSON into the exact prompt text.
-- `generate_llm_diagnosis(verdict)` is called once per incident from
-  `app.py` and its **return value is rendered as page content** in an
-  `st.info(...)` box. Replace the placeholder body with a real API call
-  (OpenAI, Anthropic, local model, etc.) — no other file needs to change.
-
-```python
-def generate_llm_diagnosis(verdict: dict) -> str:
-    from openai import OpenAI
-    client = OpenAI()
-    resp = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": build_prompt(verdict)}],
-        max_tokens=120,
-    )
-    return resp.choices[0].message.content
-```
-
-Because the verdict JSON is small (~10 fields, no raw rows), this call
-should be cheap — a few hundred tokens per incident, not per row.
-
-## File layout
-
-```
-anomaly-streamlit-app/
-├── app.py                  # Streamlit UI: KPIs, trend charts, per-incident detail
-├── clickhouse_queries.py   # All SQL: trigger scan, dispersion ranking, culprit naming
-├── llm_stub.py             # <-- wire your own LLM call here
-├── requirements.txt
-├── Dockerfile
-├── docker-compose.yml
-├── .env.example → provided as `example.env` (copy to `.env`)
-└── README.md
-```
