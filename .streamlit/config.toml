@@ -1,0 +1,55 @@
+# Heimdall for InMobi — ClickHouse-inspired theme.
+#
+# Rebuilt using Streamlit's FULL theming system (this version has far more
+# than the "classic 5 keys" — see docs.streamlit.io/develop/api-reference/
+# configuration/config.toml). Two real ClickHouse values anchor this:
+# background #151515 and accent yellow #FAFF69, both sourced directly from
+# clickhouse.design's own page metadata. Everything else is a reasonable
+# composition in that spirit (dark background, yellow as an accent only,
+# per ClickHouse's own stated rule), not literal internal design tokens.
+#
+# [theme.light] and [theme.dark] give BOTH variants, so Streamlit's native
+# Settings-menu light/dark switcher has something real to switch between —
+# a flat [theme] table only defines one look and can suppress that switcher.
+#
+# Config-native settings are preferred here over injected CSS wherever a
+# real key exists, because Streamlit has a confirmed, open bug (GitHub
+# issue #10384) where markdown/html-injected <style> blocks can be present
+# in the DOM but silently fail to apply. Config.toml values are compiled
+# into the components directly and aren't subject to that failure mode.
+
+[theme]
+# Shared across both light and dark (per docs, these can't be split):
+# a Google-Fonts-hosted heading font as a stand-in for ClickHouse's actual
+# (commercial, non-CDN-hosted) Basier Square.
+headingFont = "Space Grotesk:https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&display=swap"
+buttonRadius = "small"
+showWidgetBorder = true
+showSidebarBorder = true
+
+[theme.dark]
+primaryColor = "#FAFF69"
+backgroundColor = "#151515"
+secondaryBackgroundColor = "#1E1E1E"
+textColor = "#F2F2F0"
+borderColor = "#2A2A2A"
+linkColor = "#FAFF69"
+
+[theme.dark.sidebar]
+backgroundColor = "#1A1A1A"
+primaryColor = "#FAFF69"
+
+[theme.light]
+# A darker gold, not the raw #FAFF69 — that pale yellow reads as low-contrast
+# text/links against a white background; ClickHouse's own light-mode use is
+# more restrained for the same reason.
+primaryColor = "#8A7000"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F4F4F2"
+textColor = "#151515"
+borderColor = "#E0E0E0"
+linkColor = "#8A7000"
+
+[theme.light.sidebar]
+backgroundColor = "#F7F7F2"
+primaryColor = "#8A7000"
