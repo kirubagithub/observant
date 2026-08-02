@@ -51,12 +51,41 @@ cp example.env .env   # edit it
 streamlit run app.py
 ```
 
+## Use the provided schema to ingest data
+
+This repository includes `schemas.sql`, which creates the raw event table,
+lookup tables, dictionary sources, hourly and daily aggregate tables, and
+materialized views that populate those aggregates automatically.
+
+The basic ingestion flow is:
+
+1. Create or choose the target ClickHouse database (for example `inmobi_cat`).
+2. Run the schema file against that database:
+
+```bash
+clickhouse-client \
+  --host "$CLICKHOUSE_HOST" --port "$CLICKHOUSE_PORT" \
+  --user "$CLICKHOUSE_USER" --password "$CLICKHOUSE_PASSWORD" \
+  --secure=1 \
+  --database "$CLICKHOUSE_DATABASE" \
+  < schemas.sql
+```
+
+3. Load raw event rows into `inmobi_cat.ad_events`.
+4. Populate the lookup tables: `inmobi_cat.apps`, `inmobi_cat.advertisers`, and
+   `inmobi_cat.geo_device`.
+5. The materialized views will aggregate those rows into
+   `inmobi_cat.ad_events_daily_agg` and `inmobi_cat.ad_events_hourly_agg`.
+
+If you already have your own aggregated table, set `CLICKHOUSE_TABLE` or
+`CLICKHOUSE_TABLE_DAILY` / `CLICKHOUSE_TABLE_HOURLY` to point the app at it.
+
 ## Configuration
 
 All connection settings come from environment variables (loaded from `.env`
 via `python-dotenv`, or injected by Docker/Compose):
 
-| Variable               | Meaning                                      | Default              |
+| Variable                | Meaning                                        | Default              |
 |-------------------------|-----------------------------------------------|-----------------------|
 | `CLICKHOUSE_HOST`       | ClickHouse Cloud host                         | `localhost`           |
 | `CLICKHOUSE_PORT`       | HTTPS port                                    | `8443`                |
@@ -65,6 +94,18 @@ via `python-dotenv`, or injected by Docker/Compose):
 | `CLICKHOUSE_DATABASE`   | Database containing the agg table             | `inmobi`              |
 | `CLICKHOUSE_SECURE`     | Use TLS (`true`/`false`)                      | `true`                |
 | `CLICKHOUSE_TABLE`      | Daily aggregate table name (editable in UI too)| `ad_events_daily_agg` |
+| `CLICKHOUSE_TABLE_DAILY` | Daily aggregate table name used by the daily grain | `ad_events_daily_agg` |
+| `CLICKHOUSE_DAILY_TIME_COL` | Date column name for the daily table | `date` |
+| `CLICKHOUSE_TABLE_HOURLY` | Hourly aggregate table name used by the hourly grain | `ad_events_hourly_agg` |
+| `CLICKHOUSE_HOURLY_TIME_COL` | DateTime column name for the hourly table | `hour` |
+
+The sidebar can switch between Daily and Hourly grains. If you use the hourly table, set `CLICKHOUSE_TABLE_HOURLY` and `CLICKHOUSE_HOURLY_TIME_COL` in `.env` to match your schema.
+
+Notes:
+
+- `CLICKHOUSE_TABLE` is the default table name used by the daily grain unless `CLICKHOUSE_TABLE_DAILY` is set.
+- `CLICKHOUSE_TABLE_DAILY` and `CLICKHOUSE_DAILY_TIME_COL` explicitly configure the daily grain.
+- `CLICKHOUSE_TABLE_HOURLY` and `CLICKHOUSE_HOURLY_TIME_COL` explicitly configure the hourly grain.
 
 Sidebar sliders (no restart needed):
 
